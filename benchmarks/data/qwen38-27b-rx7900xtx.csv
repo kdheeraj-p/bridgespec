@@ -1,0 +1,41 @@
+evidence_class,config,backend,target_quant,context_alloc,kv_type,workload,reasoning,cache_state,n_runs,tok_s_summary,acceptance,publication_status
+historical,LM Studio starting setup,Vulkan,unknown,unknown,unknown,mixed,unknown,unknown,1,about 36,,approximate starting point
+measured,No speculation,Vulkan,IQ4_XS,short,unknown,code,off,warm,3,median 43.84,,controlled initial matrix
+measured,MTP n3 stock,Vulkan,IQ4_XS,short,unknown,code,off,warm,3,median 89.67,87.7%,controlled initial matrix
+measured,DFlash n3 stock,Vulkan,IQ4_XS,short,unknown,code,off,warm,3,median 89.85,87.9%,controlled initial matrix
+measured,MTP n4 stock,Vulkan,IQ4_XS,short,unknown,code,off,warm,3,median 61.58,78.5%,controlled initial matrix
+measured,DFlash n4 stock,Vulkan,IQ4_XS,short,unknown,code,off,warm,3,median 62.91,80.0%,controlled initial matrix
+audit_grade,Vulkan MTP control,Vulkan,Q4_0,16384,f16,code,off,counterbalanced,10,mean 104.530 range 104.098-105.073,about 82%,public headline control
+audit_grade,HIP MTP sidecar,Vulkan+HIP,Q4_0,16384,f16,code,off,counterbalanced,10,mean 106.895 range 106.526-107.410,about 82%,public headline
+audit_grade,Vulkan MTP control,Vulkan,Q4_0,16384,f16,agentic edit,off,counterbalanced,10,mean 117.748 range 116.959-118.314,98.55%,public headline control
+audit_grade,HIP MTP sidecar,Vulkan+HIP,Q4_0,16384,f16,agentic edit,off,counterbalanced,10,mean 120.681 range 120.451-120.833,98.55%,public headline
+matrix,Vulkan plain,Vulkan,Q4_0,8192,f16,code,off,warm,3,median 45.0,,broad matrix
+matrix,Vulkan plain,Vulkan,Q4_0,8192,f16,agentic edit,off,warm,2,median 44.5,,broad matrix
+matrix,Vulkan plain,Vulkan,Q4_0,8192,f16,extended code,off,warm,2,median 44.6,,broad matrix
+matrix,Vulkan plain,Vulkan,Q4_0,8192,f16,prose,off,warm,2,median 44.9,,broad matrix
+matrix,HIP plain,HIP,Q4_0,8192,f16,code,off,warm,3,median 39.8,,broad matrix
+matrix,HIP plain,HIP,Q4_0,8192,f16,agentic edit,off,warm,2,median 39.8,,broad matrix
+matrix,HIP plain,HIP,Q4_0,8192,f16,extended code,off,warm,2,median 39.9,,broad matrix
+matrix,HIP plain,HIP,Q4_0,8192,f16,prose,off,warm,2,median 39.9,,broad matrix
+matrix,Vulkan MTP n3,Vulkan,Q4_0,8192,f16,code,off,warm,3,median 106.4,82.1%,broad matrix
+matrix,Vulkan MTP n3,Vulkan,Q4_0,8192,f16,agentic edit,off,warm,2,median 120.2,98.6%,broad matrix
+matrix,Vulkan MTP n3,Vulkan,Q4_0,8192,f16,extended code,off,warm,2,median 106.7,about 83.1%,broad matrix
+matrix,Vulkan MTP n3,Vulkan,Q4_0,8192,f16,prose,off,warm,2,median 77.8,about 51.5%,broad matrix
+matrix,HIP DFlash pre-tune,HIP,Q4_0,8192,f16,code,off,warm,3,median 96.1,66.4%,broad matrix
+matrix,HIP DFlash pre-tune,HIP,Q4_0,8192,f16,agentic edit,off,warm,2,median about 128.25,95.5%,broad matrix
+matrix,HIP DFlash pre-tune,HIP,Q4_0,8192,f16,extended code,off,warm,2,median 93.7,64.6%,broad matrix
+matrix,HIP DFlash pre-tune,HIP,Q4_0,8192,f16,prose,off,warm,2,median 56.9,33.3%,broad matrix
+development_high_water,HIP DFlash tuned,HIP,Q4_0,8192,f16,code,off,sequential same process,3,median 109.448 range 109.230-109.493,66.76%,experimental not production
+development_high_water,HIP DFlash tuned,HIP,Q4_0,8192,f16,agentic edit,off,sequential same process,2,median 146.040 range 145.930-146.151,95.52%,experimental not production
+development_high_water,HIP DFlash tuned,HIP,Q4_0,8192,f16,extended code,off,sequential same process,2,median 112.677 range 112.647-112.707,68.96%,experimental not thinking
+development_high_water,HIP DFlash tuned,HIP,Q4_0,8192,f16,prose,off,sequential same process,2,median 56.758 range 56.741-56.775,27.19%,experimental not production
+release_candidate,HIP DFlash cache-correct local observation,HIP,Q4_0,16384,f16,code,off,cache RAM disabled,1,84.2,,single local run
+release_candidate,HIP DFlash cache-correct local observation,HIP,Q4_0,16384,f16,agentic edit,off,cache RAM disabled,3,111.8-112.4,555/581 each,three local runs
+release_candidate,HIP DFlash cache-correct local observation,HIP,Q4_0,16384,f16,prose,off,cache RAM disabled,1,43.7,,single local run
+diagnostic,HIP DFlash full re-prefill,HIP,Q4_0,16384,f16,agentic edit,off,request cache disabled,4,134.5 135.8 138.7 136.3,555/581 each,not default due TTFT cost
+context_curve,HIP MTP sidecar,Vulkan+HIP,Q4_0,131072,q4_0,decode at about 49K,off,frozen matrix,multiple,mean 66.98,,representative long context
+context_curve,Vulkan MTP,Vulkan,Q4_0,131072,q4_0,decode at about 49K,off,frozen matrix,multiple,mean 67.92,,representative long context
+context_curve,HIP MTP sidecar,Vulkan+HIP,Q4_0,131072,q4_0,decode at about 98K,off,frozen matrix,multiple,mean 50.56,,representative long context
+context_curve,Vulkan MTP,Vulkan,Q4_0,131072,q4_0,decode at about 98K,off,frozen matrix,multiple,mean 53.27,,representative long context
+context_curve,HIP MTP sidecar,Vulkan+HIP,Q4_0,131072,q4_0,decode at about 127K,off,frozen matrix,multiple,mean 46.35,,representative long context
+context_curve,Vulkan MTP,Vulkan,Q4_0,131072,q4_0,decode at about 127K,off,frozen matrix,multiple,mean 49.59,,representative long context

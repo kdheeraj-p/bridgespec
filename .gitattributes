@@ -1,0 +1,15 @@
+* text=auto
+*.hip text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ps1 text eol=crlf
+*.patch text eol=lf
+# Unified diffs require a single prefix space on blank context lines. Treating
+# those structural characters as trailing-whitespace errors corrupts patches.
+*.patch whitespace=-blank-at-eol,-blank-at-eof
+*.csv text eol=lf
+.gitignore text eol=lf

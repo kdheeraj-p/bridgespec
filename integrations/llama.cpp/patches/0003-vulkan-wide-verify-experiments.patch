@@ -1,0 +1,259 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 585e10d45ac79cfc563b767040b8a529e86f1c59..1947fb19da0d9426203a4172972f307791865577 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2109,6 +2109,13 @@ private:
+ std::mutex vk_memory_logger::log_mutex;
+ 
+ static bool vk_perf_logger_enabled = false;
++
++// K-quant DMMV at widths 5..8 measures ~10-30x below bandwidth on AMD PRO drivers
++// (gfx1100); the quantized GEMM path is healthy at those widths. Opt-in reroute.
++static bool ggml_vk_kquant_wide_prefers_mm(ggml_type t, int64_t ncols) {
++    static const bool enabled = getenv("GGML_VK_KQUANT_WIDE_GEMM") != nullptr;
++    return enabled && ncols >= 5 && (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K);
++}
+ static bool vk_perf_logger_concurrent = false;
+ static bool vk_enable_sync_logger = false;
+ // number of calls between perf logger prints
+@@ -5194,6 +5201,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             rm_stdq = 2;
+             rm_kq = 4;
+             rm_stdq_int = 4;
++        } else {
++            // TEMP experiment: NUM_ROWS tuning for int mmvq on RDNA3
++            const char * env_rows = getenv("GGML_VK_RM_STDQ_INT");
++            if (env_rows) {
++                rm_stdq_int = (uint32_t) atoi(env_rows);
++                rm_kq_int   = rm_stdq_int;
++            }
+         }
+     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
+         rm_stdq = 2;
+@@ -5312,6 +5326,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_S][i], "mul_mat_vec_iq1_s_q8_1_f32", arr_dmmv_iq1_s_q8_1_f32_len[reduc], arr_dmmv_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_M][i], "mul_mat_vec_iq1_m_q8_1_f32", arr_dmmv_iq1_m_q8_1_f32_len[reduc], arr_dmmv_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
++                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ4_XS][i], "mul_mat_vec_iq4_xs_q8_1_f32", arr_dmmv_iq4_xs_q8_1_f32_len[reduc], arr_dmmv_iq4_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+ 
+             }
+ #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+@@ -5367,6 +5382,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ1_S], "mul_mat_vec_id_iq1_s_q8_1_f32", arr_dmmv_id_iq1_s_q8_1_f32_len[reduc], arr_dmmv_id_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_iq_int(0), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(0)}, 1, true, use_subgroups, subgroup_size_int);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ1_M], "mul_mat_vec_id_iq1_m_q8_1_f32", arr_dmmv_id_iq1_m_q8_1_f32_len[reduc], arr_dmmv_id_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_iq_int(0), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(0)}, 1, true, use_subgroups, subgroup_size_int);
++            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ4_XS], "mul_mat_vec_id_iq4_xs_q8_1_f32", arr_dmmv_id_iq4_xs_q8_1_f32_len[reduc], arr_dmmv_id_iq4_xs_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
+         }
+ #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
+     }
+@@ -7774,6 +7790,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+             case GGML_TYPE_Q6_K:
+             case GGML_TYPE_IQ1_S:
+             case GGML_TYPE_IQ1_M:
++            case GGML_TYPE_IQ4_XS:
+                 break;
+             default:
+                 return nullptr;
+@@ -7941,6 +7958,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
+             case GGML_TYPE_Q6_K:
+             case GGML_TYPE_IQ1_S:
+             case GGML_TYPE_IQ1_M:
++            case GGML_TYPE_IQ4_XS:
+                 break;
+             default:
+                 return nullptr;
+@@ -10039,7 +10057,8 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
+         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
+     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
+     // when ne12 and ne13 are one.
+-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
++    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1 &&
++                !ggml_vk_kquant_wide_prefers_mm(src0->type, dst->ne[1]))) &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+     } else {
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+index 18d441ead40e11f7d86f924b8af138e31a20b8bb..0eb8fe94d7e8298dfc19e731e0987bce73a8c8b0 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+@@ -11,7 +11,7 @@
+ 
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+-#if defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K)
++#if defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K) || defined(DATA_A_IQ4_XS)
+ #define K_PER_ITER 16
+ #elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
+ #define K_PER_ITER 8
+@@ -73,6 +73,41 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+     }
+ }
+ 
++#if defined(DATA_A_Q4_0)
++// weight-stationary variant: decode each A block once, apply to all NUM_COLS columns
++void iter_ws(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
++    i32vec2    a_qs[NUM_ROWS];
++    FLOAT_TYPE a_d[NUM_ROWS];
++
++    uint ibi = first_row*p.ncols;
++    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
++        const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
++        ibi += p.ncols;
++        a_qs[n] = repack(a_block_idx, b_qs_idx);
++        a_d[n]  = get_dm(a_block_idx);
++    }
++
++    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++        const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
++        const uint b_block_idx_outer = b_block_idx / 4;
++        const uint b_block_idx_inner = b_block_idx % 4;
++        cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
++        cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
++        cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
++
++        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
++            int32_t q_sum = 0;
++            q_sum += dotPacked4x8EXT(a_qs[n].x, cache_b_qs[0]);
++            q_sum += dotPacked4x8EXT(a_qs[n].y, cache_b_qs[1]);
++            temp[j][n] += mul_q8_1(q_sum, a_d[n], cache_b_ds, 4);
++        }
++    }
++}
++#define ITER_FN iter_ws
++#else
++#define ITER_FN iter
++#endif
++
+ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     const uint tid = gl_LocalInvocationID.x;
+ 
+@@ -99,7 +134,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     while (num_iters >= 4) {
+         // Manually partially unroll the loop
+         [[unroll]] for (uint k = 0; k < 4; ++k) {
+-            iter(temp, first_row, num_rows, col, b_qs_idx);
++            ITER_FN(temp, first_row, num_rows, col, b_qs_idx);
+             col += col_stride;
+         }
+ 
+@@ -108,15 +143,15 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+ 
+     if (num_iters >= 2) {
+         // Manually partially unroll the loop
+-        iter(temp, first_row, num_rows, col, b_qs_idx);
++        ITER_FN(temp, first_row, num_rows, col, b_qs_idx);
+         col += col_stride;
+-        iter(temp, first_row, num_rows, col, b_qs_idx);
++        ITER_FN(temp, first_row, num_rows, col, b_qs_idx);
+         col += col_stride;
+         num_iters -= 2;
+     }
+ 
+     if (num_iters > 0) {
+-        iter(temp, first_row, num_rows, col, b_qs_idx);
++        ITER_FN(temp, first_row, num_rows, col, b_qs_idx);
+     }
+ 
+     reduce_result(temp, d_offset, first_row, num_rows, tid);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+index a5403ac82121d5294b3b46426ba46a900450efa3..5698354ce7b6a55c201d77854c078af07c864695 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+@@ -448,6 +448,51 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+ }
+ #endif
+ 
++#if defined(DATA_A_IQ4_XS)
++// 4-byte loads for IQ4_XS blocks (136 bytes); kvalues served from shared memory (see PR #10409)
++i32vec4 repack4(uint ib_k, uint ib32, uint iqs) {
++    // iqs == 0: low nibbles (elements 0..15), iqs == 1: high nibbles (elements 16..31)
++    const uint shift = 4 * iqs;
++    const uint32_t v0 = (data_a_packed32[ib_k].qs[4 * ib32    ] >> shift) & 0x0F0F0F0F;
++    const uint32_t v1 = (data_a_packed32[ib_k].qs[4 * ib32 + 1] >> shift) & 0x0F0F0F0F;
++    const uint32_t v2 = (data_a_packed32[ib_k].qs[4 * ib32 + 2] >> shift) & 0x0F0F0F0F;
++    const uint32_t v3 = (data_a_packed32[ib_k].qs[4 * ib32 + 3] >> shift) & 0x0F0F0F0F;
++
++    const u8vec4 i0 = unpack8(v0);
++    const u8vec4 i1 = unpack8(v1);
++    const u8vec4 i2 = unpack8(v2);
++    const u8vec4 i3 = unpack8(v3);
++
++    return i32vec4(pack32(i8vec4(kvalues_iq4nl_i8[i0.x], kvalues_iq4nl_i8[i0.y], kvalues_iq4nl_i8[i0.z], kvalues_iq4nl_i8[i0.w])),
++                   pack32(i8vec4(kvalues_iq4nl_i8[i1.x], kvalues_iq4nl_i8[i1.y], kvalues_iq4nl_i8[i1.z], kvalues_iq4nl_i8[i1.w])),
++                   pack32(i8vec4(kvalues_iq4nl_i8[i2.x], kvalues_iq4nl_i8[i2.y], kvalues_iq4nl_i8[i2.z], kvalues_iq4nl_i8[i2.w])),
++                   pack32(i8vec4(kvalues_iq4nl_i8[i3.x], kvalues_iq4nl_i8[i3.y], kvalues_iq4nl_i8[i3.z], kvalues_iq4nl_i8[i3.w])));
++}
++
++float get_d_scale(uint ib_k, uint ib32) {
++    const uint sl = (data_a_packed32[ib_k].scales_l >> (8 * (ib32 >> 1) + 4 * (ib32 & 1))) & 0xF;
++    const uint sh = (uint(data_a_packed32[ib_k].scales_h) >> (2 * ib32)) & 3;
++    return float(data_a_packed32[ib_k].d) * float(int(sl | (sh << 4)) - 32);
++}
++
++FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
++    const uint ib_k = ib_a / 8;
++    const uint ib32 = ib_a % 8;
++
++    int32_t q_sum = 0;
++    const i32vec4 qs_a = repack4(ib_k, ib32, iqs);
++    const float d_scale = get_d_scale(ib_k, ib32);
++
++    q_sum += dotPacked4x8EXT(qs_a.x, cache_b_qs[0]);
++    q_sum += dotPacked4x8EXT(qs_a.y, cache_b_qs[1]);
++    q_sum += dotPacked4x8EXT(qs_a.z, cache_b_qs[2]);
++    q_sum += dotPacked4x8EXT(qs_a.w, cache_b_qs[3]);
++
++    // kvalues are signed and unbiased, no q8_1 sum correction needed
++    return FLOAT_TYPE(float(cache_b_ds.x) * d_scale * float(q_sum));
++}
++#endif
++
+ #if defined(DATA_A_IQ1_S)
+ void repack8(uint ib, uint iqs, out i32vec4 out0, out i32vec4 out1) {
+     const uint ib32 = iqs / 32;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+index adb1bb8b32b5db771079baae9d07f89abeb6dd35..080aa3f67bbd36e14c5729e67691bab3656d5441 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+@@ -1811,6 +1811,9 @@ const int8_t kvalues_iq4nl_const[16] = {
+ };
+ 
+ shared FLOAT_TYPE kvalues_iq4nl[16];
++#if defined(MMQ)
++shared int8_t kvalues_iq4nl_i8[16];
++#endif
+ 
+ #define NEEDS_INIT_IQ_SHMEM
+ void init_iq_shmem(uvec3 wgsize)
+@@ -1818,6 +1821,9 @@ void init_iq_shmem(uvec3 wgsize)
+     // copy the table into shared memory and sync
+     for (uint i = gl_LocalInvocationIndex.x; i < kvalues_iq4nl.length(); i += wgsize.x) {
+         kvalues_iq4nl[i] = FLOAT_TYPE(kvalues_iq4nl_const[i]);
++#if defined(MMQ)
++        kvalues_iq4nl_i8[i] = kvalues_iq4nl_const[i];
++#endif
+     }
+     barrier();
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 6c9f76af1c9c5e4d7e3cc2f00c1fe79af5dd5bf6..dd4692f9957aef4a1d03238e6260f279f25ee9df 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -765,7 +765,7 @@ void process_shaders() {
+ 
+         // mul mat vec with integer dot product
+ #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+-        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m") {
++        if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs") {
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+@@ -1245,7 +1245,7 @@ void write_output_files() {
+ 
+     for (const std::string& btype : btypes) {
+     for (const auto& tname : type_names) {
+-        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m") {
++        if (btype == "q8_1" && !is_legacy_quant(tname) && tname != "mxfp4" && !is_k_quant(tname) && tname != "iq1_s" && tname != "iq1_m" && tname != "iq4_xs") {
+             continue;
+         }
+         hdr << "extern const void * arr_dmmv_"   << tname << "_" << btype << "_f32_data[3];\n";

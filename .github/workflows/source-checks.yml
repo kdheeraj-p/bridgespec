@@ -1,0 +1,40 @@
+name: Source checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate source tree
+        shell: powershell
+        run: .\scripts\verify-source.ps1
+
+      - name: Test artifact manifest parser
+        shell: powershell
+        run: |
+          $clangxx = 'C:\Program Files\LLVM\bin\clang++.exe'
+          if (-not (Test-Path -LiteralPath $clangxx)) { throw "clang++ not found at $clangxx" }
+          & $clangxx -std=c++17 -O2 src\mtp\artifact_manifest_test.cpp -o artifact_manifest_test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'artifact manifest test compile failed' }
+          .\artifact_manifest_test.exe
+          if ($LASTEXITCODE -ne 0) { throw 'artifact manifest test failed' }

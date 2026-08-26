@@ -1,0 +1,1320 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index b0ad48eb483de8f93c5991699f4b58180baeb1b0..e5aaa879e7a2a18ff57da471c3f733f4d3537824 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -14,12 +14,23 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <chrono>
+ #include <cmath>
+ #include <cstring>
+ #include <iomanip>
+ #include <map>
+ #include <cinttypes>
+ 
++#ifdef _WIN32
++#   ifndef WIN32_LEAN_AND_MEAN
++#       define WIN32_LEAN_AND_MEAN
++#   endif
++#   ifndef NOMINMAX
++#       define NOMINMAX
++#   endif
++#   include <windows.h>
++#endif
++
+ #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+ #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+ #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+@@ -928,6 +939,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     bool    is_mrope       = false;
+     int32_t selector_top_k = 0;
+ 
++    // LLAMA_SPEC_DUMP: golden-set event log for the DFlash HIP-drafter parity
++    // harness. type 10 = process chunk (n_chunk, pos[n_chunk], features
++    // [n_chunk x n_embd_enc]); type 11 = draft (id_last, n_past, out ids).
++    FILE * dump_f = nullptr;
++
++    // LLAMA_SPEC_HIP_DFLASH: run the DFlash2 drafter on a HIP sidecar DLL —
++    // replaces the encoder+inject decodes and the noise decode+selector with
++    // one sidecar call each. -np 1, dflash2 only. Failure => drafting disabled.
++    typedef int (*dflash_chunk_t)(const int32_t *, const float *, int);
++    typedef int (*dflash_draft_t)(int32_t, int32_t, int32_t *);
++    bool dflash_hip = false;
++    bool dflash_disabled = false;
++    dflash_chunk_t dflash_chunk_fn = nullptr;
++    dflash_draft_t dflash_draft_fn = nullptr;
++
++    // LLAMA_SPEC_HIP_DEBUG: cycle-phase wall-clock split (steady-state generation only)
++    const bool spc_dbg = getenv("LLAMA_SPEC_HIP_DEBUG") != nullptr;
++    const bool spc_noextract = getenv("LLAMA_SPEC_HIP_NOEXTRACT") != nullptr;
++    std::chrono::high_resolution_clock::time_point spc_t_draft_out{};
++    std::chrono::high_resolution_clock::time_point spc_t_proc_out{};
++    double spc_ms_verify = 0.0, spc_ms_host = 0.0, spc_ms_draft = 0.0;
++    int    spc_n_verify  = 0,   spc_n_host  = 0,   spc_n_draft  = 0;
++
+     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
+     const bool is_dspark;
+ 
+@@ -1027,9 +1061,44 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             }
+         }
+ 
++#ifdef _WIN32
++        if (const char * dll_path = getenv("LLAMA_SPEC_HIP_DFLASH")) {
++            const char * wdir = getenv("LLAMA_SPEC_HIP_DFLASH_DIR");
++            const bool dll_path_abs = strlen(dll_path) > 2 &&
++                    ((dll_path[1] == ':' && (dll_path[2] == '\\' || dll_path[2] == '/')) || (dll_path[0] == '\\' && dll_path[1] == '\\'));
++            HMODULE m = (is_dflash2 && wdir && dll_path_abs) ? LoadLibraryA(dll_path) : nullptr;
++            if (m) {
++                typedef int (*init_t)(const char *);
++                typedef int (*check_t)(int32_t, int32_t);
++                typedef int (*release_abi_t)(void);
++                init_t  init_fn  = (init_t)  (void *) GetProcAddress(m, "spec_dflash_init");
++                check_t check_fn = (check_t) (void *) GetProcAddress(m, "spec_dflash_check");
++                release_abi_t release_abi_fn = (release_abi_t) (void *) GetProcAddress(m, "spec_dflash_release_abi");
++                dflash_chunk_fn = (dflash_chunk_t) (void *) GetProcAddress(m, "spec_dflash_chunk");
++                dflash_draft_fn = (dflash_draft_t) (void *) GetProcAddress(m, "spec_dflash_draft");
++                const bool abi_ok = release_abi_fn && release_abi_fn() == 2 && check_fn && check_fn(n_embd_enc, block_size) == 0;
++                if (init_fn && dflash_chunk_fn && dflash_draft_fn && abi_ok && init_fn(wdir) == 0) {
++                    dflash_hip = true;
++                    GGML_ASSERT(n_seq == 1 && "LLAMA_SPEC_HIP_DFLASH requires -np 1");
++                    SPC_INF("%s", "DFlash HIP sidecar active\n");
++                } else {
++                    dflash_disabled = true;
++                    SPC_WRN("DFlash HIP sidecar init failed (abi_ok=%d) - DRAFTING DISABLED\n", (int) abi_ok);
++                }
++            } else if (is_dflash2) {
++                dflash_disabled = true;
++                SPC_WRN("%s", "DFlash HIP sidecar unavailable - DRAFTING DISABLED\n");
++            }
++        }
++#endif
++
+         // turn on extraction of the target layers' input embeddings
+-        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
++        // LLAMA_SPEC_HIP_NOEXTRACT: measurement-only A/B — leaves extraction off, so
++        // drafts are garbage; used to isolate extraction's cost in the verify decode.
++        if (!getenv("LLAMA_SPEC_HIP_NOEXTRACT")) {
++            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
++                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
++            }
+         }
+ 
+         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
+@@ -1038,6 +1103,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     }
+ 
+     ~common_speculative_impl_draft_dflash() override {
++        if (dump_f) {
++            fclose(dump_f);
++            dump_f = nullptr;
++        }
+         auto * ctx_dft = this->params.ctx_dft;
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+             if (backend_chains[seq_id] == nullptr) {
+@@ -1065,7 +1134,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         }
+ 
+         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
+-        if (pos_max < N - 1) {
++        // The HIP sidecar owns its KV and intentionally leaves ctx_dft empty.
++        // This consistency check only describes the native draft context.
++        if (!dflash_hip && pos_max < N - 1) {
+             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
+                     "Drafts may degrade.\n",
+                     __func__, (int) pos_max, N - 1);
+@@ -1077,6 +1148,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             return true;
+         }
+ 
++        if (spc_dbg && batch_in.n_tokens <= 16 && spc_t_draft_out.time_since_epoch().count() != 0) {
++            spc_ms_verify += std::chrono::duration<double, std::milli>(
++                    std::chrono::high_resolution_clock::now() - spc_t_draft_out).count();
++            spc_n_verify++;
++        }
++
+         // Target prefill may contain token IDs or multimodal embeddings. Both
+         // produce the target-layer features used to seed the draft KV cache, so
+         // skipping the embedding batches leaves a hole in the draft's cache and
+@@ -1085,6 +1162,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         const bool has_tokens     = batch_in.token != nullptr;
+         const bool has_embeddings = batch_in.embd  != nullptr;
+         if (has_tokens == has_embeddings) {
++            spc_t_proc_out = std::chrono::high_resolution_clock::now();
+             return true;
+         }
+ 
+@@ -1119,6 +1197,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+ 
++                if (spc_noextract) {
++                    continue; // A/B measurement mode: no features to gather
++                }
++
++                // NODRAFT=2: sidecar fully idle — skip the chunk call too
++                static const char * spc_nodraft_p = getenv("LLAMA_SPEC_HIP_NODRAFT");
++                if (dflash_hip && spc_nodraft_p && spc_nodraft_p[0] == '2') {
++                    continue;
++                }
++
+                 // gather this chunk's target features, interleaved by extract layer
+                 features_buf.resize((size_t) n_chunk * n_embd_enc);
+                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+@@ -1157,6 +1245,48 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                     /*.logits   =*/ nullptr,
+                 };
+ 
++                if (dump_f == nullptr) {
++                    if (const char * dp_ = getenv("LLAMA_SPEC_DUMP")) {
++                        dump_f = fopen(dp_, "wb");
++                        if (dump_f) {
++                            const uint32_t magic = 0x32464853; // "SHF2"
++                            fwrite(&magic, 4, 1, dump_f);
++                            fwrite(&n_embd_enc, 4, 1, dump_f);
++                            fwrite(&n_embd_dec, 4, 1, dump_f);
++                            fwrite(&block_size, 4, 1, dump_f);
++                            fwrite(&selector_top_k, 4, 1, dump_f);
++                        }
++                    }
++                }
++                if (dump_f) {
++                    const uint32_t typ = 10;
++                    fwrite(&typ, 4, 1, dump_f);
++                    fwrite(&n_chunk, 4, 1, dump_f);
++                    for (int32_t i = 0; i < n_chunk; ++i) {
++                        const llama_pos p_ = batch_in.pos[i_batch_beg[seq_id] + offset + i];
++                        fwrite(&p_, 4, 1, dump_f);
++                    }
++                    fwrite(features_buf.data(), sizeof(float), (size_t) n_chunk * n_embd_enc, dump_f);
++                }
++
++                if (dflash_hip) {
++                    // the sidecar runs encoder + KV inject itself; skip both decodes
++                    std::vector<int32_t> hp(n_chunk);
++                    for (int32_t i = 0; i < n_chunk; ++i) {
++                        hp[i] = (int32_t) batch_in.pos[i_batch_beg[seq_id] + offset + i];
++                    }
++                    if (dflash_chunk_fn(hp.data(), features_buf.data(), n_chunk) != 0) {
++                        SPC_ERR("%s", "DFlash HIP chunk failed - DRAFTING DISABLED\n");
++                        dflash_hip = false;
++                        dflash_disabled = true;
++                    }
++                    continue;
++                }
++
++                if (dflash_disabled) {
++                    continue;
++                }
++
+                 int32_t rc = llama_encode(ctx_dft, enc_batch);
+                 if (rc != 0) {
+                     LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+@@ -1192,6 +1322,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             }
+         }
+ 
++        spc_t_proc_out = std::chrono::high_resolution_clock::now();
+         return true;
+     }
+ 
+@@ -1200,6 +1331,65 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ 
+         common_batch_clear(batch);
+ 
++        if (dflash_disabled) {
++            return;
++        }
++        if (dflash_hip) {
++            const auto spc_td0 = std::chrono::high_resolution_clock::now();
++            if (spc_dbg && spc_t_proc_out.time_since_epoch().count() != 0) {
++                spc_ms_host += std::chrono::duration<double, std::milli>(spc_td0 - spc_t_proc_out).count();
++                spc_n_host++;
++            }
++            llama_seq_id seq_one = -1;
++            int nsd = 0;
++            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
++                if (dparams[s].drafting) { nsd++; seq_one = s; }
++            }
++            // LLAMA_SPEC_HIP_NODRAFT: measurement-only — suppress drafting so verify
++            // runs at width 1 while the sidecar stays loaded (1) or fully idle (2).
++            static const char * spc_nodraft = getenv("LLAMA_SPEC_HIP_NODRAFT");
++            if (nsd == 1 && !spc_nodraft) {
++                auto & dp = dparams[seq_one];
++                int32_t ids[8];
++                const int n = dflash_draft_fn(dp.id_last, (int32_t) dp.n_past, ids);
++                if (n < 0 || n > 7) {
++                    SPC_ERR("%s", "DFlash HIP draft failed - DRAFTING DISABLED\n");
++                    dflash_hip = false;
++                    dflash_disabled = true;
++                    return;
++                }
++                auto & result = *dp.result;
++                int lim = std::min<int>(n, params.n_max);
++                if (dp.n_max > 0) lim = std::min<int>(lim, dp.n_max);
++                const int32_t n_vocab_tgt = llama_vocab_n_tokens(
++                        llama_model_get_vocab(llama_get_model(params.ctx_tgt)));
++                for (int j = 0; j < lim; ++j) {
++                    if (ids[j] < 0 || ids[j] >= n_vocab_tgt) {
++                        SPC_ERR("DFlash HIP returned invalid token id %d - DRAFTING DISABLED\n", ids[j]);
++                        result.clear();
++                        dflash_hip = false;
++                        dflash_disabled = true;
++                        return;
++                    }
++                    result.push_back(ids[j]);
++                }
++                if (result.size() < (size_t) params.n_min) {
++                    result.clear();
++                }
++            }
++            if (spc_dbg) {
++                spc_t_draft_out = std::chrono::high_resolution_clock::now();
++                spc_ms_draft += std::chrono::duration<double, std::milli>(spc_t_draft_out - spc_td0).count();
++                if (++spc_n_draft % 50 == 0) {
++                    fprintf(stderr, "[spec-cycle] draft %.2f ms | verify-gap %.2f ms (%d) | host-gap %.2f ms (%d)\n",
++                            spc_ms_draft / spc_n_draft,
++                            spc_n_verify ? spc_ms_verify / spc_n_verify : 0.0, spc_n_verify,
++                            spc_n_host   ? spc_ms_host   / spc_n_host   : 0.0, spc_n_host);
++                }
++            }
++            return;
++        }
++
+         // build one batch holding every drafting sequence's noise block into a single decode)
+         // record where each block starts and its size
+         std::vector<int32_t> i_block_beg(n_seq, -1);
+@@ -1276,6 +1466,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+                 if (result.size() < (size_t) params.n_min) {
+                     result.clear();
+                 }
++
++                if (dump_f) {
++                    const uint32_t typ = 11;
++                    const int32_t idl = dp.id_last;
++                    const int32_t npast = (int32_t) dp.n_past;
++                    const uint32_t nid = (uint32_t) result.size();
++                    fwrite(&typ, 4, 1, dump_f);
++                    fwrite(&idl, 4, 1, dump_f);
++                    fwrite(&npast, 4, 1, dump_f);
++                    fwrite(&nid, 4, 1, dump_f);
++                    if (nid > 0) {
++                        fwrite(result.data(), 4, nid, dump_f);
++                    }
++                    fflush(dump_f);
++                }
+                 continue;
+             }
+ 
+@@ -1379,6 +1584,50 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // draft-vocab prototype: maps slice-local draft head ids back to full-vocab ids
++    std::vector<int32_t> draft_head_ids;
++
++    // LLAMA_SPEC_CHAIN_LEAN: draft all n_max tokens in one chained decode
++    bool chain_graph = false;
++
++    // catch-up rows deferred from process() and prepended to the chain decode,
++    // which merges the two evals. Only in chain mode; flushed standalone when
++    // no chain decode follows to absorb them.
++    static constexpr int32_t defer_max = 64;
++    bool defer_enabled = false;
++    struct {
++        std::vector<llama_token>  tok;
++        std::vector<llama_pos>    pos;
++        std::vector<llama_seq_id> seq;
++        std::vector<float>        embd;
++    } defer;
++
++    // LLAMA_SPEC_DUMP: golden-set event log for the HIP drafter parity harness.
++    // Records the full draft-side event stream (catch-up rows + draft in/out) so a
++    // standalone replayer can rebuild the draft KV and check token-exact parity.
++    FILE * dump_f = nullptr;
++
++    // LLAMA_SPEC_HIP_SIDECAR: run the MTP drafter on a HIP sidecar DLL instead of
++    // decoding ctx_dft (catch-up rows and drafts both route to the sidecar, which
++    // keeps its own KV; ctx_dft stays loaded but is never decoded). -np 1 only.
++    typedef int (*spec_hip_catchup_t)(const int32_t *, const int32_t *, const float *, int);
++    typedef int (*spec_hip_draft_t)(int32_t, int32_t, const float *, int, int32_t *);
++    typedef int (*spec_hip_draft2_t)(int32_t, int32_t, const float *, int, int32_t *, float *);
++    bool hip_sidecar = false;
++    spec_hip_catchup_t hip_catchup_fn = nullptr;
++    spec_hip_draft_t   hip_draft_fn   = nullptr;
++    spec_hip_draft2_t  hip_draft2_fn  = nullptr;
++    // LLAMA_SPEC_HIP_P_MIN: stop the draft chain at the first token whose drafter
++    // confidence falls below this. Off (0) = current behavior. Under temperature
++    // sampling this prunes likely-rejected drafts and recovers throughput.
++    float hip_p_min = 0.0f;
++
++    // target-only mode: drafting disabled entirely. Entered when the sidecar was
++    // requested but failed (at init or runtime): with the n_ctx=512 draft-context
++    // reclaim the Vulkan drafter is not a safe fallback (tiny KV, prefill-sized
++    // batches would fail), so we stop drafting instead — slower, never wrong.
++    bool draft_disabled = false;
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+         , params(params.draft)
+@@ -1402,7 +1651,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 ctx_dft ? "yes" : "no",
+                 common_speculative_get_devices_str(this->params.devices).c_str());
+ 
+-        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
++        // size for the TARGET's batch: process() mirrors target prefill chunks, and
++        // with the HIP sidecar the draft ctx may be created much smaller than the
++        // target (n_ctx=512 reclaim), which would shrink llama_n_batch(ctx_dft)
++        const int32_t n_b = (int32_t) std::max(llama_n_batch(ctx_dft), llama_n_batch(ctx_tgt));
+         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+         // llama_batch_init allocates only one of token/embd; MTP needs both.
+         // TODO: fix, how to call without malloc
+@@ -1418,8 +1670,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+ 
+         // offload draft sampling to the backend
++        // (chain mode samples in-graph and emits several packed rows per seq,
++        //  which backend sampling does not support)
+         backend_chains.assign(n_seq, nullptr);
+-        if (this->params.backend_sampling) {
++        if (this->params.backend_sampling && getenv("LLAMA_SPEC_CHAIN_LEAN") == nullptr) {
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+@@ -1433,11 +1687,108 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+         }
+ 
++        if (const char * dump_path = getenv("LLAMA_SPEC_DUMP")) {
++            dump_f = fopen(dump_path, "wb");
++            if (dump_f) {
++                const uint32_t magic = 0x50444853; // "SHDP"
++                const uint32_t ne    = (uint32_t) n_embd;
++                fwrite(&magic, 4, 1, dump_f);
++                fwrite(&ne,    4, 1, dump_f);
++                SPC_INF("golden-set dump -> %s (n_embd=%d)\n", dump_path, n_embd);
++            } else {
++                SPC_WRN("cannot open LLAMA_SPEC_DUMP file %s\n", dump_path);
++            }
++        }
++
++        // draft-vocab prototype: id table for a row-sliced draft head (LLAMA_DRAFT_HEAD_IDS = path to little-endian i32 file)
++        if (const char * ids_path = getenv("LLAMA_DRAFT_HEAD_IDS")) {
++            FILE * f = fopen(ids_path, "rb");
++            if (f) {
++                fseek(f, 0, SEEK_END);
++                const long sz = ftell(f);
++                fseek(f, 0, SEEK_SET);
++                draft_head_ids.resize(sz / sizeof(int32_t));
++                const size_t rd = fread(draft_head_ids.data(), sizeof(int32_t), draft_head_ids.size(), f);
++                fclose(f);
++                draft_head_ids.resize(rd);
++                SPC_INF("draft head id table: %zu entries from %s\n", draft_head_ids.size(), ids_path);
++                GGML_ASSERT(!draft_head_ids.empty());
++                GGML_ASSERT((this->params.backend_sampling || getenv("LLAMA_SPEC_CHAIN_LEAN") != nullptr) &&
++                        "sliced draft head requires backend sampling (or in-graph chain remap)");
++            } else {
++                SPC_WRN("cannot open LLAMA_DRAFT_HEAD_IDS file %s\n", ids_path);
++            }
++        }
++
++#ifdef _WIN32
++        if (const char * dll_path = getenv("LLAMA_SPEC_HIP_SIDECAR")) {
++            const char * wdir = getenv("LLAMA_SPEC_HIP_WEIGHTS");
++            const char * ids  = getenv("LLAMA_DRAFT_HEAD_IDS");
++            const bool dll_path_abs = strlen(dll_path) > 2 &&
++                    ((dll_path[1] == ':' && (dll_path[2] == '\\' || dll_path[2] == '/')) || (dll_path[0] == '\\' && dll_path[1] == '\\'));
++            HMODULE m = dll_path_abs ? LoadLibraryA(dll_path) : nullptr;
++            if (m && wdir && ids) {
++                typedef int (*init_t)(const char *, const char *);
++                typedef int (*check_t)(int32_t, int32_t);
++                typedef int (*release_abi_t)(void);
++                init_t  init_fn  = (init_t)  (void *) GetProcAddress(m, "spec_hip_init");
++                check_t check_fn = (check_t) (void *) GetProcAddress(m, "spec_hip_check");
++                release_abi_t release_abi_fn = (release_abi_t) (void *) GetProcAddress(m, "spec_hip_release_abi");
++                hip_catchup_fn = (spec_hip_catchup_t) (void *) GetProcAddress(m, "spec_hip_catchup");
++                hip_draft_fn   = (spec_hip_draft_t)   (void *) GetProcAddress(m, "spec_hip_draft");
++                hip_draft2_fn  = (spec_hip_draft2_t)  (void *) GetProcAddress(m, "spec_hip_draft2");
++                if (const char * pm = getenv("LLAMA_SPEC_HIP_P_MIN")) {
++                    hip_p_min = (float) atof(pm);
++                    if (hip_draft2_fn == nullptr && hip_p_min > 0.0f) {
++                        SPC_WRN("%s", "LLAMA_SPEC_HIP_P_MIN set but DLL lacks spec_hip_draft2 - gating disabled\n");
++                        hip_p_min = 0.0f;
++                    }
++                }
++                const bool abi_ok = release_abi_fn && release_abi_fn() == 1 && check_fn != nullptr &&
++                        check_fn(n_embd, (int32_t) draft_head_ids.size()) == 0;
++                if (init_fn && hip_catchup_fn && hip_draft_fn && abi_ok && init_fn(wdir, ids) == 0) {
++                    hip_sidecar = true;
++                    GGML_ASSERT(n_seq == 1 && "LLAMA_SPEC_HIP_SIDECAR requires -np 1");
++                    SPC_INF("%s", "HIP sidecar active: MTP drafting runs on the HIP DLL\n");
++                } else {
++                    // the draft ctx was already created reclaimed (n_ctx=512), so the
++                    // Vulkan drafter is not usable — run target-only from the start
++                    draft_disabled = true;
++                    SPC_WRN("HIP sidecar init failed (dll=%s wdir=%s abi_ok=%d) - DRAFTING DISABLED (target-only mode)\n", dll_path, wdir ? wdir : "(null)", (int) abi_ok);
++                }
++            } else {
++                draft_disabled = true;
++                SPC_WRN("HIP sidecar unavailable (dll load=%d, wdir=%s, ids=%s) - DRAFTING DISABLED (target-only mode)\n", m != nullptr, wdir ? wdir : "(null)", ids ? ids : "(null)");
++            }
++        }
++#endif
++
+         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+ 
+         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
++        chain_graph   = !is_mem_shared && !chain_heads && getenv("LLAMA_SPEC_CHAIN_LEAN") != nullptr;
++        if (hip_sidecar && chain_graph) {
++            // chain mode defers catch-up rows past the sidecar hook, desyncing its
++            // KV; the sidecar already fuses the cycle, so chain adds nothing anyway
++            SPC_WRN("%s", "LLAMA_SPEC_CHAIN_LEAN ignored: HIP sidecar takes precedence\n");
++            chain_graph = false;
++        }
++        if (getenv("LLAMA_SPEC_CHAIN_LEAN") != nullptr) {
++            SPC_INF("chain lean: is_mem_shared=%d chain_heads=%d -> chain_graph=%d\n",
++                    (int) is_mem_shared, (int) chain_heads, (int) chain_graph);
++        }
++        if (chain_graph) {
++            // the chain emits token ids only — a p_min gate cannot be applied
++            GGML_ASSERT(this->params.p_min <= 0.0f && "LLAMA_SPEC_CHAIN_LEAN requires --spec-draft-p-min 0");
++        }
++        if (chain_graph && !draft_head_ids.empty()) {
++            // the sliced-head fallback loop needs backend sampling, which chain
++            // mode disables — chain + sliced head is single-sequence only
++            GGML_ASSERT(n_seq == 1 && "LLAMA_SPEC_CHAIN_LEAN with a sliced draft head requires -np 1");
++        }
++        defer_enabled = chain_graph;
+ 
+         if (chain_heads) {
+             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
+@@ -1476,6 +1823,67 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             batch.token = nullptr;
+         }
+         llama_batch_free(batch);
++
++        if (dump_f) {
++            fclose(dump_f);
++            dump_f = nullptr;
++        }
++    }
++
++    // decode deferred catch-up rows standalone (no logits); used when no chain decode
++    // follows to absorb them
++    bool flush_deferred() {
++        if (defer.tok.empty()) {
++            return true;
++        }
++
++        auto * ctx_dft = this->params.ctx_dft;
++        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++
++        common_batch_clear(batch);
++        for (size_t k = 0; k < defer.tok.size(); ++k) {
++            common_batch_add(batch, defer.tok[k], defer.pos[k], { defer.seq[k] }, false);
++            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, defer.embd.data() + k * (size_t) n_embd, row_bytes);
++        }
++        defer.tok.clear();
++        defer.pos.clear();
++        defer.seq.clear();
++        defer.embd.clear();
++
++        const int32_t rc = llama_decode(ctx_dft, batch);
++        if (rc != 0) {
++            SPC_ERR("llama_decode(ctx_dft) deferred flush failed rc=%d\n", (int) rc);
++            return false;
++        }
++        return true;
++    }
++
++    // drop deferred rows of seq_id with pos >= pos_from; returns true if any dropped
++    bool drop_deferred_from(llama_seq_id seq_id, llama_pos pos_from) {
++        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++
++        size_t w = 0;
++        for (size_t k = 0; k < defer.tok.size(); ++k) {
++            if (defer.seq[k] == seq_id && defer.pos[k] >= pos_from) {
++                continue;
++            }
++            if (w != k) {
++                defer.tok[w] = defer.tok[k];
++                defer.pos[w] = defer.pos[k];
++                defer.seq[w] = defer.seq[k];
++                std::memmove(defer.embd.data() + w * (size_t) n_embd,
++                             defer.embd.data() + k * (size_t) n_embd, row_bytes);
++            }
++            w++;
++        }
++
++        const bool dropped = w < defer.tok.size();
++        defer.tok.resize(w);
++        defer.pos.resize(w);
++        defer.seq.resize(w);
++        defer.embd.resize(w * (size_t) n_embd);
++
++        return dropped;
+     }
+ 
+     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+@@ -1530,8 +1938,58 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+ 
++        // deferred rows at or past the incoming batch positions are stale: either a
++        // new prompt rewound the sequence, or they hold candidates a later verify
++        // rejected. Drop them and clear matching draft cells before any decode.
++        if (defer_enabled && !defer.tok.empty()) {
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                if (i_batch_beg[seq_id] < 0) {
++                    continue;
++                }
++                const llama_pos pos_min_in = batch_in.pos[i_batch_beg[seq_id]];
++                if (drop_deferred_from(seq_id, pos_min_in)) {
++                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_min_in, -1);
++                }
++            }
++        }
++
++        if (!is_mem_shared && defer_enabled && n_tokens <= defer_max) {
++            // defer the catch-up rows; the chain decode absorbs them, which saves
++            // one eval per round. Flush first if rows from an undrafted round remain.
++            if (!defer.tok.empty() && (int32_t) defer.tok.size() + n_tokens > defer_max) {
++                if (!flush_deferred()) {
++                    return false;
++                }
++            }
++
++            const size_t k0 = defer.tok.size();
++            defer.tok.resize(k0 + n_tokens);
++            defer.pos.resize(k0 + n_tokens);
++            defer.seq.resize(k0 + n_tokens);
++            defer.embd.resize((k0 + n_tokens) * (size_t) n_embd);
++
++            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
++            for (int k = 0; k < n_tokens; ++k) {
++                defer.tok[k0 + k] = batch_in.token[k];
++                defer.pos[k0 + k] = batch_in.pos[k];
++                defer.seq[k0 + k] = batch_in.seq_id[k][0];
++                // shift the tgt embeddings to the right by one position (see the non-deferred path)
++                if (k > 0) {
++                    std::memcpy(defer.embd.data() + (k0 + k) * (size_t) n_embd, h_tgt + (size_t) (k - 1) * n_embd, row_bytes);
++                }
++            }
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                if (i_batch_beg[seq_id] < 0) {
++                    continue;
++                }
++                std::memcpy(defer.embd.data() + (k0 + i_batch_beg[seq_id]) * (size_t) n_embd, pending_h[seq_id].data(), row_bytes);
++            }
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+-        if (!is_mem_shared) {
++        } else if (!is_mem_shared) {
++            if (!flush_deferred()) {
++                return false;
++            }
++
+             common_batch_clear(batch);
+ 
+             for (int k = 0; k < n_tokens; ++k) {
+@@ -1561,6 +2019,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+             }
+ 
++            if (dump_f) {
++                const uint32_t typ = 0, nrec = (uint32_t) batch.n_tokens;
++                fwrite(&typ,  4, 1, dump_f);
++                fwrite(&nrec, 4, 1, dump_f);
++                for (int k = 0; k < batch.n_tokens; ++k) {
++                    fwrite(&batch.token[k], 4, 1, dump_f);
++                    fwrite(&batch.pos[k],   4, 1, dump_f);
++                    fwrite(batch.embd + (size_t) k * n_embd, 4, n_embd, dump_f);
++                }
++            }
++
++            bool hip_done = false;
++            if (hip_sidecar) {
++                // the sidecar keeps its own KV; skip the ctx_dft decode entirely
++                if (hip_catchup_fn(batch.token, batch.pos, batch.embd, batch.n_tokens) == 0) {
++                    hip_done = true;
++                } else {
++                    // the reclaimed Vulkan draft ctx cannot take over (512-token KV,
++                    // prefill-sized batches): stop drafting entirely. Target-only is
++                    // slower but crash-free and always correct.
++                    SPC_ERR("%s", "HIP sidecar catchup failed - DRAFTING DISABLED (target-only mode)\n");
++                    hip_sidecar = false;
++                    draft_disabled = true;
++                    hip_done = true; // skip the Vulkan decode below
++                }
++            }
++            if (draft_disabled) {
++                hip_done = true;
++            }
++            if (!hip_done) {
++
+             auto * mem_dft = llama_get_memory(ctx_dft);
+ 
+             bool ok = true;
+@@ -1591,6 +2080,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (!ok) {
+                 return false;
+             }
++            } // !hip_done
+         }
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+@@ -1625,6 +2115,176 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+ 
++        // target-only mode: no drafting at all (see draft_disabled)
++        if (draft_disabled) {
++            return;
++        }
++
++        // HIP sidecar drafting: the whole 3-step greedy draft runs on the sidecar
++        // (its own KV, fed by process() catch-up); ids come back full-vocab.
++        if (hip_sidecar) {
++            llama_seq_id seq_one = -1;
++            int n_seq_drafting = 0;
++            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
++                if (dparams[s].drafting) {
++                    n_seq_drafting++;
++                    seq_one = s;
++                }
++            }
++            if (n_seq_drafting == 1) {
++                auto & dp = dparams[seq_one];
++                const int n_chain = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
++                if (n_chain >= 1) {
++                    const int32_t n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
++                    std::vector<int32_t> ids((size_t) n_chain, -1);
++                    std::vector<float> probs((size_t) n_chain, 1.0f);
++                    const int rc = hip_p_min > 0.0f
++                        ? hip_draft2_fn(dp.id_last, dp.n_past, pending_h[seq_one].data(), n_chain, ids.data(), probs.data())
++                        : hip_draft_fn(dp.id_last, dp.n_past, pending_h[seq_one].data(), n_chain, ids.data());
++                    if (rc == 0) {
++                        auto & result = *dp.result;
++                        for (int j = 0; j < n_chain; ++j) {
++                            if (ids[j] < 0) break;
++                            if (hip_p_min > 0.0f && probs[j] < hip_p_min) {
++                                break; // low-confidence tail: cheaper to let the target decide
++                            }
++                            if (ids[j] >= n_vocab_dft) {
++                                // out-of-vocab id = sidecar malfunction: drop the draft
++                                // and go target-only for good
++                                SPC_ERR("HIP sidecar returned out-of-vocab id %d - DRAFTING DISABLED (target-only mode)\n", ids[j]);
++                                result.clear();
++                                hip_sidecar = false;
++                                draft_disabled = true;
++                                break;
++                            }
++                            SPC_DBG(" - seq_id %d, hip candidate %3d: %6d '%s'\n",
++                                    seq_one, j, ids[j], common_token_to_piece(ctx_dft, ids[j]).c_str());
++                            result.push_back(ids[j]);
++                            if ((int) result.size() >= params.n_max) break;
++                        }
++                    } else {
++                        SPC_ERR("%s", "HIP sidecar draft failed - DRAFTING DISABLED (target-only mode)\n");
++                        hip_sidecar = false;
++                        draft_disabled = true;
++                    }
++                }
++                if (dp.result->size() < (size_t) params.n_min) {
++                    dp.result->clear();
++                }
++            }
++            return;
++        }
++
++        // chained drafting: one decode drafts n_max tokens for a single sequence.
++        // The graph samples greedily in-graph (with the id remap for sliced heads)
++        // and emits one packed [token id] float row per chain step.
++        if (chain_graph) {
++            llama_seq_id seq_one = -1;
++            int n_seq_drafting = 0;
++            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
++                if (dparams[s].drafting) {
++                    n_seq_drafting++;
++                    seq_one = s;
++                }
++            }
++
++            if (n_seq_drafting == 1) {
++                auto & dp = dparams[seq_one];
++                common_sampler_reset(smpls[seq_one].get());
++
++                // dp.n_max caps the round so the draft fits the remaining context
++                const int n_chain = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
++
++                // deferred rows at or past n_past hold candidates the verify
++                // rejected; the committed prefix ends at n_past - 1. Drop them.
++                drop_deferred_from(seq_one, dp.n_past);
++
++                // rows of other sequences cannot join a single-sequence chain
++                // batch; decode all remaining rows standalone in that case
++                bool defer_other = false;
++                for (size_t k = 0; k < defer.tok.size(); ++k) {
++                    defer_other = defer_other || defer.seq[k] != seq_one;
++                }
++                if (defer_other && !flush_deferred()) {
++                    return;
++                }
++
++                common_batch_clear(batch);
++
++                // deferred catch-up rows ride along, before the chain rows
++                const int n_catchup = (int) defer.tok.size();
++                for (int k = 0; k < n_catchup; ++k) {
++                    common_batch_add(batch, defer.tok[k], defer.pos[k], { defer.seq[k] }, false);
++                    std::memcpy(batch.embd + (size_t) k * n_embd, defer.embd.data() + (size_t) k * n_embd, row_bytes);
++                }
++                defer.tok.clear();
++                defer.pos.clear();
++                defer.seq.clear();
++                defer.embd.clear();
++
++                for (int j = 0; j < n_chain; ++j) {
++                    common_batch_add(batch, j == 0 ? dp.id_last : 0, dp.n_past + j, { seq_one }, true);
++                    if (j == 0) {
++                        std::memcpy(batch.embd + (size_t) n_catchup * n_embd, pending_h[seq_one].data(), row_bytes);
++                    } else {
++                        std::memset(batch.embd + (size_t) (n_catchup + j) * n_embd, 0, row_bytes);
++                    }
++                }
++
++                llama_set_mtp_chain(ctx_dft, true);
++                const int ret = llama_decode(ctx_dft, batch);
++                llama_set_mtp_chain(ctx_dft, false);
++
++                if (ret != 0) {
++                    SPC_ERR("llama_decode(chain) returned %d\n", ret);
++                    return;
++                }
++
++                // packed 1-float rows from the start of the logits buffer; the ids
++                // are already full-vocab (remap ran in-graph). No p_min gate: the
++                // chain emits no probabilities (run with --spec-draft-p-min 0)
++                const float * lp = llama_get_logits(ctx_dft);
++
++                const int32_t n_vocab_dft = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
++
++                auto & result = *dp.result;
++                for (int j = 0; j < n_chain; ++j) {
++                    const llama_token id = (llama_token) lp[j];
++
++                    // sanity: a graph that did not pack ids (wrong arch, stock
++                    // path taken) yields out-of-range values here — stop drafting
++                    if (id < 0 || id >= n_vocab_dft) {
++                        SPC_WRN("chain readback produced out-of-range id %d — dropping draft\n", (int) id);
++                        break;
++                    }
++
++                    SPC_DBG(" - seq_id %d, chain candidate %3d: %6d '%s'\n",
++                            seq_one, j, id,
++                            common_token_to_piece(ctx_dft, id).c_str());
++
++                    result.push_back(id);
++
++                    if ((int) result.size() >= params.n_max) {
++                        break;
++                    }
++                }
++
++                if (dp.result->size() < (size_t) params.n_min) {
++                    dp.result->clear();
++                }
++                return;
++            }
++        }
++
++        // the stock loop cannot absorb deferred rows; decode them standalone first
++        // (only reachable in chain mode when several sequences draft at once)
++        if (defer_enabled && !defer.tok.empty()) {
++            if (!flush_deferred()) {
++                return;
++            }
++            common_batch_clear(batch);
++        }
++
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+ 
+@@ -1639,6 +2299,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+ 
++            if (dump_f && seq_id == 0) {
++                const uint32_t typ = 1;
++                fwrite(&typ,        4, 1, dump_f);
++                fwrite(&dp.id_last, 4, 1, dump_f);
++                fwrite(&dp.n_past,  4, 1, dump_f);
++                fwrite(pending_h[seq_id].data(), 4, n_embd, dump_f);
++            }
++
+             i_last[seq_id] = batch.n_tokens - 1;
+ 
+             if (chain_heads) {
+@@ -1695,7 +2363,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 }
+ 
+                 // add drafted token for each sequence
+-                const llama_token id = cur_p->data[0].id;
++                llama_token id = cur_p->data[0].id;
++                // draft-vocab prototype: sliced head ids are slice-local
++                if (!draft_head_ids.empty() && id >= 0 && (size_t) id < draft_head_ids.size()) {
++                    id = draft_head_ids[id];
++                }
+ 
+                 // only collect very high-confidence draft tokens
+                 if (cur_p->data[0].p < params.p_min) {
+@@ -1763,6 +2435,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 dp.result->clear();
+             }
+         }
++
++        if (dump_f && !dparams.empty() && dparams[0].drafting) {
++            const uint32_t typ = 2;
++            const uint32_t n_ids = (uint32_t) dparams[0].result->size();
++            fwrite(&typ,   4, 1, dump_f);
++            fwrite(&n_ids, 4, 1, dump_f);
++            if (n_ids > 0) {
++                fwrite(dparams[0].result->data(), 4, n_ids, dump_f);
++            }
++            fflush(dump_f);
++        }
+     }
+ 
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+@@ -2421,6 +3104,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
+         }
+     }
+ 
++    // chained MTP drafting outputs one row per chain step in one decode
++    if (getenv("LLAMA_SPEC_CHAIN_LEAN") != nullptr) {
++        const int32_t per_seq = std::max(1, params_spec.n_max);
++        result.n_outputs_max = std::max(result.n_outputs_max, params.n_parallel * per_seq);
++    }
++
+     return result;
+ }
+ 
+@@ -2448,6 +3137,16 @@ common_speculative_init_result::common_speculative_init_result(
+ 
+     if (spec_mtp) {
+         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++#ifdef _WIN32
++        if (getenv("LLAMA_SPEC_HIP_SIDECAR") != nullptr) {
++            // the HIP sidecar replaces this context's decoding entirely; keep only
++            // a token KV so its cache/compute buffers stop costing VRAM. The
++            // emergency Vulkan fallback is limited to this window (drafting simply
++            // stops past it — correctness is always guarded by target verify).
++            cparams.n_ctx = 512;
++            LOG_INF("%s: HIP sidecar active - MTP draft context reduced to n_ctx=512\n", __func__);
++        }
++#endif
+     }
+ 
+     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b5b4f5dbdaf18c9779e2270bac0e9bd2d0424ad8..d0dfa546302e1496400348657e3f53d0b39f19e7 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -117,6 +117,7 @@ llama_context::llama_context(
+     cparams.embeddings              = params.embeddings;
+     cparams.embeddings_nextn        = false;
+     cparams.embeddings_nextn_masked = false;
++    cparams.mtp_chain               = false;
+     cparams.offload_kqv             = params.offload_kqv;
+     cparams.no_perf                 = params.no_perf;
+     cparams.warmup                  = false;
+@@ -1181,6 +1182,10 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
+     cparams.nextn_layer_offset = offset;
+ }
+ 
++void llama_context::set_mtp_chain(bool value) {
++    cparams.mtp_chain = value;
++}
++
+ void llama_context::set_causal_attn(bool value) {
+     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+ 
+@@ -1870,7 +1875,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             if (n_outputs) {
+                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
++                // graphs can emit narrower per-row outputs than n_vocab (e.g. the
++                // MTP chain packs [token id] rows); copy what exists
++                const size_t nbytes = std::min<size_t>(ggml_nbytes(t_logits), (size_t) n_outputs*n_vocab*sizeof(float));
++                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, nbytes);
+             }
+         }
+ 
+@@ -3794,6 +3802,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
+     ctx->set_nextn_layer_offset(offset);
+ }
+ 
++void llama_set_mtp_chain(llama_context * ctx, bool value) {
++    ctx->set_mtp_chain(value);
++}
++
+ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+     if (!ctx) {
+         return nullptr;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b562aa66d15b08ca559b6baa09ab7855..1463d8897403ed4f8b77395cc62d92411f140ef6 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -116,6 +116,7 @@ struct llama_context {
+     void set_embeddings_nextn(bool value, bool masked);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
++    void set_mtp_chain(bool value);
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 574ce9592072d03517699deccefe1f462f47e4ae..59a7029e9da3b2f4075ae2167125f8b4ce6badc8 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -35,6 +35,7 @@ struct llama_cparams {
+     bool embeddings;
+     bool embeddings_nextn;        // also extract the hidden state before the final output norm
+     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
++    bool mtp_chain;               // DECODER_MTP: chain rows in-graph from the first row's inputs
+     bool causal_attn;
+     bool offload_kqv;
+     bool flash_attn;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 92a759b7a0ae0b7f6b9dc9f08230f6008ae13207..30f328e849d49261621f4ea7f60fb98d179dc822 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -100,6 +100,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
+ // chain multiple trained NextN heads. Default 0 (first head).
+ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+ 
++// DECODER_MTP: draft all rows of the batch in one graph by chaining each row's
++// argmax token and hidden state into the next row's inputs. The graph then
++// emits packed per-row outputs instead of full logits rows.
++LLAMA_API void llama_set_mtp_chain(struct llama_context * ctx, bool value);
++
+ // mirrors:
+ // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1896758c5da59db7c4c185864f7b641b8575b82e..ee75742c6701841365ca2545153a06cfaee576f8 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -111,6 +111,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
+ 
+         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+     }
++
++    if (head_ids != nullptr && head_ids_data != nullptr) {
++        ggml_backend_tensor_set(head_ids, head_ids_data, 0, (size_t) n_head_ids*sizeof(int32_t));
++    }
+ }
+ 
+ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
+@@ -119,6 +123,7 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
+     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
+     res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
++    res &= (head_ids == nullptr)  || (head_ids->ne[0] == n_head_ids);
+ 
+     return res;
+ }
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 94324c7457edded62e1144b7cc160850d4c18d13..be9b51f0bfb180050fb3c2b40acd80fee9e12a75 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -151,6 +151,10 @@ public:
+     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+ 
++    ggml_tensor   * head_ids      = nullptr; // I32 [n_head_ids] chain remap: slice row -> full-vocab id
++    const int32_t * head_ids_data = nullptr;
++    int64_t         n_head_ids    = 0;
++
+     const int64_t n_embd = 0;
+ };
+ 
+@@ -841,6 +845,7 @@ struct llm_graph_params {
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
++            cparams.mtp_chain               == other.cparams.mtp_chain               &&
+             cparams.causal_attn             == other.cparams.causal_attn             &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 9b22cb05f29bc702c5aef4b7075ed3c9266fa91a..3ba9f5793d1b4e3e9e32696f5660290506d35c53 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -410,6 +410,7 @@ namespace GGUFMeta {
+     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
+     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
++    template bool llama_model_loader::get_arr<int32_t>(const std::string & key, std::vector<int32_t> & result, bool required);
+ 
+     template<typename T>
+     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
+diff --git a/src/models/models.h b/src/models/models.h
+index 180b30a46d76533c2cffa561a44ecf229d736171..93908f243d1e7a06508eea3eaf0faf00b2fefe45 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2224,6 +2224,9 @@ struct llama_model_qwen35 : public llama_model_base {
+         graph_mtp(const llama_model & model, const llm_graph_params & params);
+     };
+ 
++    // full-vocab token ids for a row-sliced draft head (empty = head covers the full vocab)
++    std::vector<int32_t> draft_vocab_ids;
++
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 309dd432447c4a264b4a6c5b34ece6a2e66007cc..1855b3284b98c02f7dea9016f6c044c5dc0ae86e 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -1,5 +1,6 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
++#include "llama-kv-cache.h"
+ 
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+@@ -115,8 +116,17 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+         layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              mtp_flags);
+         layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              mtp_flags);
+         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
+-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
++        // accept a row-sliced draft head when the file carries one (draft-vocab prototype)
++        const std::string head_name = "blk." + std::to_string(il) + ".nextn.shared_head_head.weight";
++        const ggml_tensor * head_meta = ml.get_tensor_meta(head_name.c_str());
++        const int64_t n_head_vocab = head_meta ? head_meta->ne[1] : n_vocab;
++        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_head_vocab }, mtp_flags|TENSOR_NOT_REQUIRED);
+         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
++        if (layer.nextn.shared_head_head && n_head_vocab < (int64_t) n_vocab) {
++            // sliced head: the file must carry the slice's full-vocab token ids
++            ml.get_arr(std::string("qwen35.nextn.draft_vocab_ids"), draft_vocab_ids, /*required=*/ true);
++            GGML_ASSERT((int64_t) draft_vocab_ids.size() == n_head_vocab && "draft_vocab_ids size must match sliced head rows");
++        }
+     };
+ 
+     for (int i = 0; i < n_layer; ++i) {
+@@ -533,6 +543,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+ 
+     ggml_tensor * h_embd = inp->h;
+ 
++    // chain-mode remap table: slice-local argmax row -> full-vocab token id
++    const auto & qmodel = static_cast<const llama_model_qwen35 &>(model);
++    ggml_tensor * head_ids_t = nullptr;
++    if (cparams.mtp_chain && !qmodel.draft_vocab_ids.empty()) {
++        inp->head_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) qmodel.draft_vocab_ids.size());
++        ggml_set_input(inp->head_ids);
++        ggml_set_name(inp->head_ids, "mtp_head_ids");
++        inp->head_ids_data = qmodel.draft_vocab_ids.data();
++        inp->n_head_ids    = (int64_t) qmodel.draft_vocab_ids.size();
++        head_ids_t = inp->head_ids;
++    }
++
+     res->add_input(std::move(inp));
+ 
+     ggml_tensor * inp_pos     = build_inp_pos();
+@@ -540,6 +562,191 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+ 
+     auto * inp_attn = build_attn_inp_kv();
+ 
++    const float kq_scale_c = hparams.f_attention_scale == 0.0f
++            ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
++
++    // chained drafting: rows 1..n-1 take their inputs from the previous row's
++    // in-graph argmax and hidden state, so one decode drafts n_tokens tokens.
++    // n_tokens == 1 still takes this path: the driver's readback expects the
++    // packed [token id] rows whenever the chain flag is set
++    if (cparams.mtp_chain && ubatch.n_seqs_unq == 1 && ubatch.token) {
++        const auto * mctx_kv = static_cast<const llama_kv_cache_context *>(mctx);
++
++        // per-step causal masks: row j of the stock kq mask (the mask builder pads
++        // masks to exactly n_tokens rows, so plain row views work)
++        ggml_tensor * kq_mask = inp_attn->get_kq_mask();
++        const int64_t n_kv = kq_mask->ne[0];
++
++        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
++
++        ggml_tensor * k_idxs = inp_attn->get_k_idxs();
++        ggml_tensor * v_idxs = inp_attn->get_v_idxs();
++
++        // normalize and project the token/hidden inputs into the block input
++        // (norm -> eh_proj); rows are independent through this projection
++        auto build_proj = [&](ggml_tensor * tok_in, ggml_tensor * h_in) -> ggml_tensor * {
++            ggml_tensor * h_norm_b = build_norm(h_in, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
++            ggml_tensor * e_norm_b = build_norm(tok_in, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
++
++            return build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm_b, h_norm_b, 0), layer.nextn.eh_proj_s);
++        };
++
++        // one MTP block over `width` projected rows starting at batch row `row0`;
++        // returns the post-ffn hidden state. The K/V stores are expanded, so a
++        // caller that only needs the rows' cache side effects can ignore the result.
++        auto build_block = [&](ggml_tensor * cur_in, int64_t row0, int64_t width) -> ggml_tensor * {
++            ggml_tensor * cur_b = cur_in;
++
++            ggml_tensor * inpSA_b = cur_b;
++
++            cur_b = build_norm(cur_b, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++
++            ggml_tensor * Qfull_b = build_lora_mm(layer.wq, cur_b, layer.wq_s);
++
++            ggml_tensor * Q_b = ggml_view_3d(ctx0, Qfull_b,
++                    n_embd_head, n_head, width,
++                    ggml_element_size(Qfull_b) * n_embd_head * 2,
++                    ggml_element_size(Qfull_b) * n_embd_head * 2 * n_head,
++                    0);
++            Q_b = build_norm(Q_b, layer.attn_q_norm, nullptr, LLM_NORM_RMS, il);
++
++            ggml_tensor * gate_b = ggml_view_3d(ctx0, Qfull_b,
++                    n_embd_head, n_head, width,
++                    ggml_element_size(Qfull_b) * n_embd_head * 2,
++                    ggml_element_size(Qfull_b) * n_embd_head * 2 * n_head,
++                    ggml_element_size(Qfull_b) * n_embd_head);
++            gate_b = ggml_cont_2d(ctx0, gate_b, n_embd_head * n_head, width);
++
++            ggml_tensor * K_b = build_lora_mm(layer.wk, cur_b, layer.wk_s);
++            K_b = ggml_reshape_3d(ctx0, K_b, n_embd_head, n_head_kv, width);
++            K_b = build_norm(K_b, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
++
++            ggml_tensor * V_b = build_lora_mm(layer.wv, cur_b, layer.wv_s);
++            V_b = ggml_reshape_3d(ctx0, V_b, n_embd_head, n_head_kv, width);
++
++            // M-RoPE positions are section-major: [dim0 x n_tokens, dim1 x n_tokens, ...]
++            ggml_tensor * pos_b = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_pos, width, 4,
++                    (size_t) n_tokens*inp_pos->nb[0], (size_t) row0*inp_pos->nb[0]));
++            pos_b = ggml_reshape_1d(ctx0, pos_b, 4*width);
++
++            Q_b = ggml_rope_multi(ctx0, Q_b, pos_b, nullptr,
++                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++                    ext_factor, attn_factor, beta_fast, beta_slow);
++            K_b = ggml_rope_multi(ctx0, K_b, pos_b, nullptr,
++                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++                    ext_factor, attn_factor, beta_fast, beta_slow);
++
++            ggml_build_forward_expand(gf, Q_b);
++            ggml_build_forward_expand(gf, V_b);
++            ggml_build_forward_expand(gf, K_b);
++
++            // store these rows' K/V so later rows attend to them through the cache
++            ggml_tensor * k_idx_b = ggml_view_1d(ctx0, k_idxs, width, row0*k_idxs->nb[0]);
++            ggml_tensor * v_idx_b = ggml_view_1d(ctx0, v_idxs, width, row0*v_idxs->nb[0]);
++            ggml_build_forward_expand(gf, mctx_kv->cpy_k(ctx0, K_b, k_idx_b, il));
++            ggml_build_forward_expand(gf, mctx_kv->cpy_v(ctx0, V_b, v_idx_b, il));
++
++            ggml_tensor * k_view = mctx_kv->get_k(ctx0, il);
++            ggml_tensor * v_view = mctx_kv->get_v(ctx0, il);
++
++            ggml_tensor * mask_b = ggml_view_2d(ctx0, kq_mask, n_kv, width, kq_mask->nb[1], (size_t) row0*kq_mask->nb[1]);
++
++            cur_b = build_attn_mha(Q_b, k_view, v_view, nullptr, mask_b, nullptr, nullptr, kq_scale_c, il);
++
++            cur_b = ggml_mul(ctx0, cur_b, ggml_sigmoid(ctx0, gate_b));
++            cur_b = build_lora_mm(layer.wo, cur_b, layer.wo_s);
++
++            cur_b = ggml_add(ctx0, cur_b, inpSA_b);
++
++            ggml_tensor * ffn_res_b = cur_b;
++            cur_b = build_norm(cur_b, layer.attn_post_norm, nullptr, LLM_NORM_RMS, il);
++
++            cur_b = build_ffn(cur_b,
++                    layer.ffn_up,   nullptr, layer.ffn_up_s,
++                    layer.ffn_gate, nullptr, layer.ffn_gate_s,
++                    layer.ffn_down, nullptr, layer.ffn_down_s,
++                    nullptr,
++                    LLM_FFN_SILU, LLM_FFN_PAR, il);
++
++            cur_b = ggml_add(ctx0, cur_b, ffn_res_b);
++
++            return cur_b;
++        };
++
++        // leading rows without outputs are catch-up rows carrying real batch
++        // inputs; they only contribute their K/V. The chain starts at the first output row.
++        int64_t n_catchup = 0;
++        while (n_catchup < n_tokens && ubatch.output && ubatch.output[n_catchup] == 0) {
++            n_catchup++;
++        }
++        const int64_t n_chain = n_tokens - n_catchup;
++        GGML_ASSERT(n_chain >= 1);
++
++        // project the whole ubatch in one pass, exactly like the stock path: the
++        // host-buffer inputs must reach split ops as full leaf tensors, not views.
++        // Slices of the projected result are sched-allocated and safe to split.
++        ggml_tensor * proj_all = build_proj(tok_embd, h_embd);
++
++        if (n_catchup > 0) {
++            ggml_tensor * proj_c = ggml_view_2d(ctx0, proj_all, proj_all->ne[0], n_catchup, proj_all->nb[1], 0);
++            build_block(proj_c, 0, n_catchup);
++        }
++
++        ggml_tensor * proj_cur = ggml_view_2d(ctx0, proj_all, proj_all->ne[0], 1, proj_all->nb[1], (size_t) n_catchup*proj_all->nb[1]);
++
++        ggml_tensor * logits_all = nullptr;
++
++        for (int64_t j = 0; j < n_chain; ++j) {
++            ggml_tensor * cur_j = build_block(proj_cur, n_catchup + j, 1);
++
++            ggml_tensor * head_norm_w2 = layer.nextn.shared_head_norm
++                    ? layer.nextn.shared_head_norm
++                    : model.output_norm;
++            ggml_tensor * h_next_j = build_norm(cur_j, head_norm_w2, nullptr, LLM_NORM_RMS, -1);
++
++            ggml_tensor * head_w2 = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
++            ggml_tensor * head_s2 = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
++
++            ggml_tensor * logits_j = build_lora_mm(head_w2, h_next_j, head_s2);
++
++            // the chain samples greedily in-graph; the host only needs the picked
++            // token. Emit it as a 1-float "logits" row per step: [token id]. This
++            // removes the per-step host sampling pass, the full-width logits
++            // transfer, and the per-step hidden-state readback.
++            ggml_tensor * id_j = ggml_argmax(ctx0, logits_j);
++            if (head_ids_t != nullptr) {
++                // sliced head: argmax gives a slice-local row; remap to the
++                // full-vocab id before re-embedding and emission
++                ggml_tensor * ids2d = ggml_reshape_2d(ctx0, head_ids_t, 1, head_ids_t->ne[0]);
++                id_j = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, ids2d, id_j), 1);
++            }
++            ggml_tensor * out_j = ggml_cast(ctx0, ggml_reshape_2d(ctx0, id_j, 1, 1), GGML_TYPE_F32);
++
++            logits_all = logits_all == nullptr ? out_j : ggml_concat(ctx0, logits_all, out_j, 1);
++
++            if (j + 1 < n_chain) {
++                // feed the argmax token and hidden state into the next step
++                ggml_tensor * tok_j = ggml_get_rows(ctx0, tok_embd_w, id_j);
++                proj_cur = build_proj(tok_j, h_next_j);
++            }
++        }
++
++        // no t_h_nextn export: the chain feeds hidden states forward in-graph and
++        // the host never reads them (pending_h comes from the target); the
++        // extraction sites null-check t_h_nextn, so skipping the export skips
++        // the n_chain x n_embd device-to-host copy entirely
++
++        // the chain logits rows are exactly the output rows; expand a view of out_ids
++        // so the unused input still gets allocated before set_inputs writes it
++        ggml_build_forward_expand(gf, ggml_view_1d(ctx0, inp_out_ids, inp_out_ids->ne[0], 0));
++
++        cb(logits_all, "result_output", -1);
++        res->t_logits = logits_all;
++        ggml_build_forward_expand(gf, logits_all);
++
++        return;
++    }
++
+     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+     cb(h_norm, "mtp_hnorm", il);
+ 
